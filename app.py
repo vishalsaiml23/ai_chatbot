@@ -1,12 +1,13 @@
 import json
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote
 from urllib.request import urlopen
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
@@ -19,6 +20,36 @@ MODEL_POOL = [
 ]
 MODEL_OPTIONS = MODEL_POOL
 MAX_HISTORY_MESSAGES = 5
+GOOGLE_SEARCH_TOOL = {"google_search": {}}
+NO_CURRENT_SOURCE_ANSWER = (
+    "I could not verify this current information from a reliable live source, "
+    "so I can't give a confirmed answer right now."
+)
+SYSTEM_PROMPT = """You are a helpful assistant. Distinguish current facts from historical facts:
+- Answer historical questions for the date or period the user specifies; do not replace a past answer with today's answer.
+- If a historical question does not specify a date or period and the answer depends on it, ask the user to clarify.
+- Treat current officeholders, prices, exchange rates, market data, recent events, and other changeable facts as time-sensitive.
+- For a time-sensitive question, use live Google Search results rather than model memory or older conversation content. Prefer authoritative primary sources, state the date the information applies to, and cite the returned sources.
+- If live sources are absent, unreliable, or conflicting, say that you cannot verify the current answer instead of guessing or presenting an old fact as current.
+"""
+CURRENT_CUE_PATTERN = re.compile(
+    r"\b(?:current(?:ly)?|today|now|latest|recent(?:ly)?|up[- ]to[- ]date|"
+    r"as of|this (?:week|month|year|morning|afternoon)|breaking|live)\b",
+    re.IGNORECASE,
+)
+HISTORICAL_CUE_PATTERN = re.compile(
+    r"\b(?:was|were|formerly|former|previous|previously|historical|history|"
+    r"in the past|at the time|back in)\b",
+    re.IGNORECASE,
+)
+CHANGEABLE_FACT_PATTERN = re.compile(
+    r"\b(?:price|prices|cost|costs|exchange rate|currency rate|stock|stocks|"
+    r"share price|market cap|worth|inflation|interest rate|weather|forecast|"
+    r"news|headlines|score|scores|election|president|prime minister|chief minister|chairperson|"
+    r"chairman|leader|governor|\bcm\b|\bpm\b|"
+    r"mayor|monarch|king|queen|ceo|officeholder)\b",
+    re.IGNORECASE,
+)
 LEGACY_MODEL_NAMES = {
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
@@ -33,6 +64,33 @@ LEGACY_MODEL_NAMES = {
     "models/gemini-pro",
     "models/gemini-3.8-flash",
 }
+
+
+def is_historical_query(prompt):
+    text = str(prompt or "")
+    if HISTORICAL_CUE_PATTERN.search(text):
+        return True
+    current_year = datetime.now(timezone.utc).year
+    return any(int(year) < current_year for year in re.findall(r"\b(?:19|20)\d{2}\b", text))
+
+
+def is_time_sensitive_query(prompt):
+    text = str(prompt or "")
+    if is_historical_query(text):
+        return False
+    return bool(CURRENT_CUE_PATTERN.search(text) or CHANGEABLE_FACT_PATTERN.search(text))
+
+
+def build_system_prompt():
+    today = datetime.now(timezone.utc).date().isoformat()
+    return f"{SYSTEM_PROMPT}\nToday's date is {today} (UTC)."
+
+
+def invoke_chat(llm, chat_history, prompt):
+    messages = [SystemMessage(content=build_system_prompt()), *chat_history]
+    if is_time_sensitive_query(prompt):
+        return llm.invoke(messages, tools=[GOOGLE_SEARCH_TOOL])
+    return llm.invoke(messages)
 
 
 def get_fallback_models(model_name):
@@ -251,6 +309,38 @@ def extract_response_text(response):
     text = str(content).strip()
     return text if text not in {"None", "{}", "[]"} else ""
 
+
+def extract_grounding_sources(response):
+    metadata = getattr(response, "response_metadata", {}) or {}
+    grounding = metadata.get("grounding_metadata", {}) if isinstance(metadata, dict) else {}
+    chunks = grounding.get("grounding_chunks", []) if isinstance(grounding, dict) else []
+    sources = []
+    seen_urls = set()
+
+    for chunk in chunks:
+        web_source = chunk.get("web", {}) if isinstance(chunk, dict) else {}
+        url = web_source.get("uri") if isinstance(web_source, dict) else None
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")) or url in seen_urls:
+            continue
+        title = web_source.get("title") or url
+        sources.append((str(title), url))
+        seen_urls.add(url)
+
+    return sources
+
+
+def format_answer(response, require_live_sources=False):
+    answer = extract_response_text(response)
+    sources = extract_grounding_sources(response)
+    if require_live_sources and (not answer or not sources):
+        return NO_CURRENT_SOURCE_ANSWER
+    if sources:
+        answer += "\n\nSources:\n" + "\n".join(
+            f"- [{title}]({url})" for title, url in sources
+        )
+    return answer
+
+
 st.markdown(
     """
     <style>
@@ -468,9 +558,9 @@ if prompt := st.chat_input("Ask me anything..."):
 
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    response = llm.invoke(st.session_state.chat_history)
+                    response = invoke_chat(llm, st.session_state.chat_history, prompt)
 
-                answer = extract_response_text(response)
+                answer = format_answer(response, is_time_sensitive_query(prompt))
                 st.markdown(answer)
 
             st.session_state.messages.append({"role": "assistant", "content": answer})

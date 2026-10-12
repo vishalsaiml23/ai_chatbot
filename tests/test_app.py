@@ -1,3 +1,6 @@
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
 import app
 
 
@@ -57,3 +60,73 @@ def test_extract_response_handles_various_formats():
     assert app.extract_response_text({"content": "hello"}) == "hello"
     assert app.extract_response_text([{"type": "text", "text": "hello"}, {"type": "text", "text": " world"}]) == "hello world"
     assert app.extract_response_text("hello") == "hello"
+
+
+class RecordingLLM:
+    def invoke(self, messages, **kwargs):
+        self.messages = messages
+        self.kwargs = kwargs
+        return SimpleNamespace(content="A generated answer.", response_metadata={})
+
+
+def test_current_officeholder_question_uses_live_search():
+    llm = RecordingLLM()
+
+    app.invoke_chat(llm, [], "current cm of tamilnadu")
+
+    assert llm.kwargs == {"tools": [app.GOOGLE_SEARCH_TOOL]}
+    assert isinstance(llm.messages[0], app.SystemMessage)
+    assert "live Google Search results" in llm.messages[0].content
+    assert "Today's date is " in llm.messages[0].content
+    assert app.is_time_sensitive_query("current cm of tamilnadu")
+
+
+def test_historical_officeholder_question_preserves_its_date():
+    llm = RecordingLLM()
+
+    response = app.invoke_chat(llm, [], "Who was the chief minister of Tamil Nadu in 2021?")
+
+    assert llm.kwargs == {}
+    assert app.is_historical_query("Who was the chief minister of Tamil Nadu in 2021?")
+    assert not app.is_time_sensitive_query("Who was the chief minister of Tamil Nadu in 2021?")
+    assert "do not replace a past answer with today's answer" in llm.messages[0].content
+    assert app.format_answer(response) == "A generated answer."
+
+
+def test_time_sensitive_answer_requires_grounding_sources():
+    response = SimpleNamespace(
+        content="The current officeholder is Example Person.",
+        response_metadata={
+            "grounding_metadata": {
+                "grounding_chunks": [
+                    {"web": {"title": "Official source", "uri": "https://example.gov/officeholder"}},
+                    {"web": {"title": "Official source", "uri": "https://example.gov/officeholder"}},
+                ]
+            }
+        },
+    )
+
+    answer = app.format_answer(response, require_live_sources=True)
+
+    assert answer.startswith("The current officeholder is Example Person.")
+    assert answer.count("https://example.gov/officeholder") == 1
+    assert "[Official source](https://example.gov/officeholder)" in answer
+
+
+def test_time_sensitive_answer_without_sources_abstains():
+    response = SimpleNamespace(
+        content="A stale generated answer.",
+        response_metadata={"grounding_metadata": {"grounding_chunks": []}},
+    )
+
+    assert app.format_answer(response, require_live_sources=True) == app.NO_CURRENT_SOURCE_ANSWER
+    assert "A stale generated answer." not in app.format_answer(response, require_live_sources=True)
+
+
+def test_changing_prices_and_recent_events_use_live_search():
+    assert app.is_time_sensitive_query("What is the current price of gold?")
+    assert app.is_time_sensitive_query("What are the latest election results?")
+    assert app.is_time_sensitive_query("Who won the election?")
+    this_year = datetime.now(timezone.utc).year
+    assert app.is_time_sensitive_query(f"What is the price of gold as of {this_year}?")
+    assert app.is_historical_query(f"What was the price of gold in {this_year - 1}?")
